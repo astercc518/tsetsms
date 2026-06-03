@@ -1,4 +1,4 @@
-# 考拉出海 Gateway（SMS / 语音 / 数据）
+# sms1 Gateway（SMS / 语音 / 数据）
 
 国际短信与多业务网关平台：提供客户门户、管理后台、HTTP API、SMPP 上游对接、Telegram 业务助手、语音（OKCC 等）与数据业务扩展能力。
 
