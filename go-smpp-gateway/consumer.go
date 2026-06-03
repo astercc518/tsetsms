@@ -1,0 +1,596 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+var (
+	rabbitConn *amqp.Connection
+	publishCh  *amqp.Channel
+	rabbitMu   sync.Mutex
+)
+
+// closeRabbitMQLocked 关闭发布通道与连接（须在持有 rabbitMu 时调用）
+func closeRabbitMQLocked() {
+	if publishCh != nil {
+		_ = publishCh.Close()
+		publishCh = nil
+	}
+	if rabbitConn != nil {
+		_ = rabbitConn.Close()
+		rabbitConn = nil
+	}
+}
+
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return def
+	}
+	return n
+}
+
+// rabbitAckOp 仅由单 goroutine 对消费 channel 执行 Ack/Nack（channel 非线程安全）
+type rabbitAckOp struct {
+	d       amqp.Delivery
+	ack     bool
+	nack    bool
+	requeue bool
+}
+
+// parseSMSLogData 将 JSON map 转为 SMSLogData（Celery JSON 数字常为 float64）
+func parseSMSLogData(m map[string]interface{}) (SMSLogData, error) {
+	var d SMSLogData
+	if v, ok := m["log_id"]; ok {
+		switch x := v.(type) {
+		case float64:
+			d.LogID = int64(x)
+		case int64:
+			d.LogID = x
+		case int:
+			d.LogID = int64(x)
+		default:
+			return d, fmt.Errorf("log_id type %T", v)
+		}
+	} else {
+		return d, fmt.Errorf("missing log_id")
+	}
+	if v, ok := m["message_id"].(string); ok {
+		d.MessageID = v
+	} else {
+		return d, fmt.Errorf("missing message_id")
+	}
+	if v, ok := m["phone_number"].(string); ok {
+		d.PhoneNumber = v
+	}
+	if v, ok := m["message"].(string); ok {
+		d.Message = v
+	}
+	if v, ok := m["channel_id"]; ok {
+		switch x := v.(type) {
+		case float64:
+			d.ChannelID = int(x)
+		case int:
+			d.ChannelID = x
+		case int64:
+			d.ChannelID = int(x)
+		}
+	}
+	if v, ok := m["batch_status"].(string); ok {
+		d.BatchStatus = v
+	}
+	if v, ok := m["record_status"].(string); ok {
+		d.RecordStatus = v
+	}
+	if v, ok := m["batch_id"]; ok {
+		switch x := v.(type) {
+		case float64:
+			d.BatchID = int64(x)
+		case int64:
+			d.BatchID = x
+		case int:
+			d.BatchID = int64(x)
+		}
+	}
+	return d, nil
+}
+
+const maxPayloadLogBytes = 4096
+
+// logPayloadParseError 无法解析或拒绝投递时的显式日志，便于与 DB pending 对账
+func logPayloadParseError(reason string, body []byte) {
+	raw := string(body)
+	if len(raw) > maxPayloadLogBytes {
+		raw = raw[:maxPayloadLogBytes] + fmt.Sprintf("… (truncated, len=%d)", len(body))
+	}
+	log.Printf("Payload Parse Error, dropping message: %s | raw=%s", reason, raw)
+}
+
+// stripCeleryEnvelope 从 Celery / kombu JSON 消息体取出 send_sms_task 的首个位置参数，
+// 或识别无信封的裸 SMSLogData 对象（须同时含 log_id 与 message_id）。
+// 第二返回值 true 表示 first 可交给 smsPayloadsFromFirstTaskArg。
+func stripCeleryEnvelope(body []byte) (first interface{}, ok bool) {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return nil, false
+	}
+
+	// ① Celery JSON / kombu 常见体：[位置参数数组, kwargs 对象, 嵌入元数据]，三段数组（v2 风格）
+	if trimmed[0] == '[' {
+		var top []interface{}
+		if err := json.Unmarshal(trimmed, &top); err != nil {
+			return nil, false
+		}
+		if len(top) == 0 {
+			return nil, false
+		}
+		posArgs, isArr := top[0].([]interface{})
+		if !isArr || len(posArgs) == 0 {
+			return nil, false
+		}
+		if posArgs[0] == nil {
+			return nil, false
+		}
+		return posArgs[0], true
+	}
+
+	// ② JSON 对象：含 "args" 的 Celery v1 信封，或裸负载
+	if trimmed[0] == '{' {
+		var m map[string]interface{}
+		if err := json.Unmarshal(trimmed, &m); err != nil {
+			return nil, false
+		}
+		if argsVal, has := m["args"]; has {
+			argsList, isList := argsVal.([]interface{})
+			if isList && len(argsList) > 0 && argsList[0] != nil {
+				return argsList[0], true
+			}
+			return nil, false
+		}
+		_, hasLog := m["log_id"]
+		_, hasMid := m["message_id"]
+		if hasLog && hasMid {
+			return m, true
+		}
+		return nil, false
+	}
+
+	return nil, false
+}
+
+// smsPayloadsFromFirstTaskArg 解析 send_sms_task 的首参：单 dict、dict 数组（批量）、或旧版 message_id 字符串。
+// 若非毒消息则 poisonReason 为空；否则为简短原因（由上层统一带 raw 打日志）。
+func smsPayloadsFromFirstTaskArg(first interface{}) (payloads []SMSLogData, poisonReason string) {
+	switch x := first.(type) {
+	case string:
+		return nil, fmt.Sprintf("legacy message_id-only payload (len=%d)", len(x))
+	case map[string]interface{}:
+		d, err := parseSMSLogData(x)
+		if err != nil {
+			return nil, fmt.Sprintf("invalid SMSLogData map: %v", err)
+		}
+		return []SMSLogData{d}, ""
+	case []interface{}:
+		var out []SMSLogData
+		for i, el := range x {
+			mm, ok := el.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Sprintf("batch args[%d] is not object (type %T)", i, el)
+			}
+			d, err := parseSMSLogData(mm)
+			if err != nil {
+				return nil, fmt.Sprintf("batch args[%d]: %v", i, err)
+			}
+			out = append(out, d)
+		}
+		return out, ""
+	default:
+		return nil, fmt.Sprintf("unsupported first task arg type %T", first)
+	}
+}
+
+// extractSmsPayloads 从 RabbitMQ body 解析 SMSLogData 列表：兼容 kombu 三段数组、Celery 对象信封、裸 JSON 负载。
+func extractSmsPayloads(body []byte) (payloads []SMSLogData, nackPoison bool) {
+	root, stripped := stripCeleryEnvelope(body)
+	if !stripped {
+		logPayloadParseError("无法识别 Celery 信封或裸 SMS JSON（需 [args,…] 或 {\"args\":…} 或 {\"log_id\",\"message_id\"}）", body)
+		return nil, true
+	}
+	payloads, reason := smsPayloadsFromFirstTaskArg(root)
+	if reason != "" {
+		logPayloadParseError(reason, body)
+		return nil, true
+	}
+	return payloads, false
+}
+
+// workerProcessDelivery 执行业务逻辑，不向 Rabbit 直接 Ack（由 ack 专用 goroutine 执行）
+func workerProcessDelivery(d amqp.Delivery, ackCh chan<- rabbitAckOp) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic in workerProcessDelivery: %v", r)
+			ackCh <- rabbitAckOp{d: d, nack: true, requeue: true}
+		}
+	}()
+
+	payloads, nackPoison := extractSmsPayloads(d.Body)
+	if nackPoison {
+		ackCh <- rabbitAckOp{d: d, nack: true, requeue: false}
+		return
+	}
+	if len(payloads) == 0 {
+		log.Printf("Could not extract smpp payload(s) from task: %s", string(d.Body))
+		ackCh <- rabbitAckOp{d: d, ack: true}
+		return
+	}
+
+	if len(payloads) == 1 {
+		log.Printf("Processing SMS Task: %s log_id=%d", payloads[0].MessageID, payloads[0].LogID)
+		kind, procErr := processSingleSMSData(payloads[0])
+		if procErr != nil {
+			log.Printf("Failed to process message %s: %v", payloads[0].MessageID, procErr)
+			ackCh <- rabbitAckOp{d: d, nack: true, requeue: kind == smsTransient}
+			return
+		}
+		ackCh <- rabbitAckOp{d: d, ack: true}
+		return
+	}
+
+	const perDeliveryCap = 4
+	sem := make(chan struct{}, perDeliveryCap)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var transientPayloads []SMSLogData
+	permanentFailed := 0
+	successCount := 0
+	for _, pl := range payloads {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(data SMSLogData) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("panic processSingleSMSData %s: %v", data.MessageID, r)
+					mu.Lock()
+					permanentFailed++
+					mu.Unlock()
+				}
+			}()
+			log.Printf("Processing SMS Task: %s", data.MessageID)
+			kind, err := processSingleSMSData(data)
+			if err != nil {
+				log.Printf("Failed to process message %s: %v", data.MessageID, err)
+			}
+			mu.Lock()
+			switch kind {
+			case smsTransient:
+				transientPayloads = append(transientPayloads, data)
+			case smsPermanent:
+				permanentFailed++
+			default:
+				successCount++
+			}
+			mu.Unlock()
+		}(pl)
+	}
+	wg.Wait()
+	totalN := len(payloads)
+
+	if len(transientPayloads) > 0 {
+		// 全部为瞬时失败（无任何消息已发出）：重投失败则 NACK 原包，避免丢失
+		allTransient := successCount == 0 && permanentFailed == 0
+		if err := republishSmppPayloads(transientPayloads); err != nil {
+			if allTransient {
+				log.Printf("ERROR: 瞬时失败重投失败，NACK 原包重入队: %v", err)
+				ackCh <- rabbitAckOp{d: d, nack: true, requeue: true}
+				return
+			}
+			log.Printf("ERROR: %d 条瞬时失败重投失败（部分已发出不可 NACK，消息将丢失）: %v", len(transientPayloads), err)
+		} else {
+			log.Printf("[REQUEUE] %d transient failed messages re-queued to sms_send_smpp", len(transientPayloads))
+		}
+	}
+
+	if permanentFailed > 0 {
+		log.Printf("WARN: %d/%d permanent failures in batch (marked failed in DB)", permanentFailed, totalN)
+	}
+	ackCh <- rabbitAckOp{d: d, ack: true}
+}
+
+// startSingleConsumerSession 建立连接、注册 sms_send_smpp 消费者并阻塞直到连接/通道结束。
+// 收到 ctx.Done() 时优雅退出：先 ch.Cancel 停止派发新 delivery，等 in-flight 处理完再返回，
+// 避免容器重启时把 prefetch 内已 submit 给上游的 SMS payload requeue 后被重复 submit。
+func startSingleConsumerSession(ctx context.Context, url string) error {
+	conn, err := amqp.Dial(url)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	pubCh, err := conn.Channel()
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("publish channel: %w", err)
+	}
+
+	rabbitMu.Lock()
+	closeRabbitMQLocked()
+	rabbitConn = conn
+	publishCh = pubCh
+	rabbitMu.Unlock()
+
+	// 结果回写队列：与 Python Celery task_queues 中 sms_result_queue 对齐
+	if _, err = pubCh.QueueDeclare("sms_result_queue", true, false, false, false, nil); err != nil {
+		_ = pubCh.Close()
+		_ = conn.Close()
+		rabbitMu.Lock()
+		closeRabbitMQLocked()
+		rabbitMu.Unlock()
+		return fmt.Errorf("declare sms_result_queue: %w", err)
+	}
+
+	ch, err := conn.Channel()
+	if err != nil {
+		rabbitMu.Lock()
+		closeRabbitMQLocked()
+		rabbitMu.Unlock()
+		return fmt.Errorf("consume channel: %w", err)
+	}
+
+	q, err := ch.QueueDeclare(
+		"sms_send_smpp", // name
+		true,            // durable
+		false,           // delete when unused
+		false,           // exclusive
+		false,           // no-wait
+		nil,             // arguments
+	)
+	if err != nil {
+		_ = ch.Close()
+		rabbitMu.Lock()
+		closeRabbitMQLocked()
+		rabbitMu.Unlock()
+		return fmt.Errorf("queue declare: %w", err)
+	}
+
+	prefetch := envInt("SMPP_GATEWAY_PREFETCH", 32)
+	if err := ch.Qos(prefetch, 0, false); err != nil {
+		_ = ch.Close()
+		rabbitMu.Lock()
+		closeRabbitMQLocked()
+		rabbitMu.Unlock()
+		return fmt.Errorf("qos: %w", err)
+	}
+
+	// 使用固定 consumer tag，便于 graceful shutdown 时 ch.Cancel(tag)
+	consumerTag := "smpp-gateway-consumer"
+	msgs, err := ch.Consume(
+		q.Name,      // queue
+		consumerTag, // consumer
+		false,       // auto-ack (set to false for manual ack)
+		false,       // exclusive
+		false,       // no-local
+		false,       // no-wait
+		nil,         // args
+	)
+	if err != nil {
+		_ = ch.Close()
+		rabbitMu.Lock()
+		closeRabbitMQLocked()
+		rabbitMu.Unlock()
+		return fmt.Errorf("consume: %w", err)
+	}
+
+	workers := envInt("SMPP_GATEWAY_WORKERS", 32)
+	log.Printf("RabbitMQ Consumer started (workers=%d prefetch=%d). Waiting for messages...", workers, prefetch)
+
+	jobs := make(chan amqp.Delivery, prefetch*2)
+	ackCh := make(chan rabbitAckOp, prefetch*4)
+
+	var ackWg sync.WaitGroup
+	ackWg.Add(1)
+	go func() {
+		defer ackWg.Done()
+		for op := range ackCh {
+			if op.ack {
+				if err := op.d.Ack(false); err != nil {
+					log.Printf("RabbitMQ Ack failed: %v", err)
+				}
+			} else if op.nack {
+				if err := op.d.Nack(false, op.requeue); err != nil {
+					log.Printf("RabbitMQ Nack failed: %v", err)
+				}
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for d := range jobs {
+				workerProcessDelivery(d, ackCh)
+			}
+		}()
+	}
+
+	// Graceful shutdown：ctx 取消时 ch.Cancel 停止派发，AMQP 会关闭 msgs 通道，
+	// 下面的 for d := range msgs 自然退出，wg.Wait 等待 in-flight delivery 完成。
+	go func() {
+		<-ctx.Done()
+		log.Printf("[SHUTDOWN] ctx cancelled, cancelling consumer tag=%s", consumerTag)
+		if err := ch.Cancel(consumerTag, false); err != nil {
+			log.Printf("[SHUTDOWN] ch.Cancel failed: %v", err)
+		}
+	}()
+
+	for d := range msgs {
+		jobs <- d
+	}
+	close(jobs)
+	wg.Wait()
+	close(ackCh)
+	ackWg.Wait()
+
+	_ = ch.Close()
+	rabbitMu.Lock()
+	closeRabbitMQLocked()
+	rabbitMu.Unlock()
+	return fmt.Errorf("deliveries channel closed")
+}
+
+// RunConsumerForever Broker 重启或网络闪断后自动重连，避免 sms_send_smpp 长期无消费者。
+// ctx 取消时停止重连循环，让 main 退出前能确实排空 in-flight。
+func RunConsumerForever(ctx context.Context, url string) {
+	const reconnectDelay = 5 * time.Second
+	for {
+		err := startSingleConsumerSession(ctx, url)
+		if ctx.Err() != nil {
+			log.Printf("RabbitMQ consumer session ended cleanly (shutdown): %v", err)
+			return
+		}
+		log.Printf("RabbitMQ consumer session ended: %v; reconnecting in %v", err, reconnectDelay)
+		select {
+		case <-time.After(reconnectDelay):
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// smsFailureKind distinguishes success, permanent failures, and transient failures
+type smsFailureKind int
+
+const (
+	smsSentOK    smsFailureKind = 0
+	smsPermanent smsFailureKind = 1
+	smsTransient smsFailureKind = 2
+)
+
+// republishSmppPayloads 将瞬时失败的 SMS 以原生 JSON 数组重投回 sms_send_smpp 队列
+func republishSmppPayloads(payloads []SMSLogData) error {
+	rabbitMu.Lock()
+	defer rabbitMu.Unlock()
+	if publishCh == nil {
+		return fmt.Errorf("RabbitMQ publish channel not ready")
+	}
+	body, err := json.Marshal(payloads)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	return publishCh.Publish(
+		"sms_send_smpp", // exchange
+		"sms_send_smpp", // routing key
+		false,
+		false,
+		amqp.Publishing{
+			ContentType:  "application/json",
+			Body:         body,
+			DeliveryMode: amqp.Persistent,
+		},
+	)
+}
+
+// PublishCeleryTask dispatches a task to the Python worker via RabbitMQ
+func PublishCeleryTask(queue string, taskName string, args []interface{}) error {
+	rabbitMu.Lock()
+	defer rabbitMu.Unlock()
+	if publishCh == nil {
+		return fmt.Errorf("RabbitMQ publish channel not ready (broker reconnecting)")
+	}
+
+	taskID := uuid.New().String()
+	payload := map[string]interface{}{
+		"args":   args,
+		"kwargs": map[string]interface{}{},
+		"task":   taskName,
+		"id":     taskID,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	err = publishCh.Publish(
+		"sms_dlr", // exchange
+		"sms_dlr", // routing key
+		false,     // mandatory
+		false,     // immediate
+		amqp.Publishing{
+			ContentType:  "application/json",
+			Body:         body,
+			DeliveryMode: amqp.Persistent,
+		},
+	)
+	return err
+}
+
+func processSingleSMSData(data SMSLogData) (smsFailureKind, error) {
+	bs := strings.ToLower(strings.TrimSpace(data.BatchStatus))
+	rs := strings.TrimSpace(data.RecordStatus)
+	// 兼容旧 payload（升级前入队、不带 batch_id 字段）：按 log_id 反查 sms_logs.batch_id。
+	// 升级后所有新 payload 都直接带 batch_id，此分支不会触发。
+	effectiveBatchID := data.BatchID
+	if effectiveBatchID == 0 {
+		effectiveBatchID = LookupBatchIDByLogID(data.LogID)
+	}
+	// 1) payload 自带 batch_status==cancelled（入队时已是取消态，少见）
+	// 2) Redis 运行期标记：cancel_batch 在入队后才执行，绝大多数取消路径走这里
+	if (bs == "cancelled" || IsBatchCancelled(effectiveBatchID)) && (rs == "pending" || rs == "queued") {
+		log.Printf("跳过 SMPP 提交: 批次已取消 message_id=%s batch_id=%d", data.MessageID, effectiveBatchID)
+		if err := publishSmsSubmitResult(data.LogID, data.MessageID, "", "failed", "批次已取消"); err != nil {
+			log.Printf("WARN: publish cancel result id=%d: %v", data.LogID, err)
+		}
+		return smsSentOK, nil
+	}
+	if rs == "failed" || rs == "expired" || rs == "delivered" || rs == "sent" {
+		log.Printf("跳过 SMPP 提交: 已是终态 message_id=%s status=%s", data.MessageID, rs)
+		return smsSentOK, nil
+	}
+
+	// 幂等兜底：payload 内 RecordStatus 是入队时快照；若网关重启后重复消费同一 delivery，
+	// 实际 DB 状态可能已变为 sent/delivered/failed/expired，必须实时查 DB 防止重复 submit。
+	// 仅在 payload 自报 pending/queued 时查询，避免对所有消息都增加 DB 开销。
+	if rs == "pending" || rs == "queued" {
+		if curStatus := LookupCurrentStatus(data.LogID); curStatus != "" && curStatus != "pending" && curStatus != "queued" {
+			log.Printf("跳过 SMPP 提交: DB 实时 status=%s (疑似重启后重复消费) message_id=%s log_id=%d",
+				curStatus, data.MessageID, data.LogID)
+			return smsSentOK, nil
+		}
+	}
+
+	err := manager.SendSMS(data.LogID, data.MessageID, data.PhoneNumber, data.Message, data.ChannelID)
+	if err != nil {
+		errStr := err.Error()
+		if len(errStr) >= 13 && errStr[:13] == "_window_full:" {
+			log.Printf("[SMPP-WARN] window full, will requeue: message_id=%s", data.MessageID)
+			return smsTransient, fmt.Errorf("window full: %s", data.MessageID)
+		}
+		if len(errStr) >= 12 && errStr[:12] == "_temp_error:" {
+			log.Printf("[SMPP-WARN] temp error, will requeue: message_id=%s err=%s", data.MessageID, errStr)
+			return smsTransient, fmt.Errorf("temp error: %s", data.MessageID)
+		}
+		if pubErr := publishSmsSubmitResult(data.LogID, data.MessageID, "", "failed", errStr); pubErr != nil {
+			log.Printf("WARN: publish failed result id=%d: %v", data.LogID, pubErr)
+		}
+		return smsPermanent, fmt.Errorf("failed to send: %v", err)
+	}
+	return smsSentOK, nil
+}

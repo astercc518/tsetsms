@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="sg" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00ffd5"/>
+      <stop offset="100%" stop-color="#1fd1e8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 圆角底板（深色霓虹品牌） -->
+  <rect width="64" height="64" rx="15" fill="#070b16"/>
+  <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="14.25" fill="none" stroke="#00ffd5" stroke-opacity="0.25" stroke-width="1.5"/>
+
+  <!-- 信号 / 均衡条标识 -->
+  <g fill="url(#sg)">
+    <rect x="13" y="33" width="8" height="18" rx="4"/>
+    <rect x="28" y="14" width="8" height="37" rx="4"/>
+    <rect x="43" y="24" width="8" height="27" rx="4"/>
+  </g>
+</svg>

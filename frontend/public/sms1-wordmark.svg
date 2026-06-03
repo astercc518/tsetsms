@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 210 44" width="210" height="44">
+  <defs>
+    <linearGradient id="wg" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#16a394"/>
+      <stop offset="1" stop-color="#22c3b2"/>
+    </linearGradient>
+  </defs>
+  <!-- 信号条标识 -->
+  <rect x="2" y="24" width="6" height="14" rx="3" fill="url(#wg)"/>
+  <rect x="12" y="8" width="6" height="30" rx="3" fill="url(#wg)"/>
+  <rect x="22" y="16" width="6" height="22" rx="3" fill="url(#wg)"/>
+  <!-- 文字 sms1.site -->
+  <text x="38" y="31" font-family="'Plus Jakarta Sans','Inter',system-ui,sans-serif" font-size="25" font-weight="800" letter-spacing="-0.5">
+    <tspan fill="#0a1425">sms</tspan><tspan fill="#16a394">1</tspan><tspan fill="#8a93a6" font-weight="700">.site</tspan>
+  </text>
+</svg>

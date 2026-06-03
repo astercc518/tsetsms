@@ -1,0 +1,675 @@
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "100m"
+    max-file: "5"
+
+services:
+  # MySQL数据库
+  mysql:
+    image: mysql:8.0
+    container_name: smsc-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpass123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-sms_system}
+      MYSQL_USER: ${MYSQL_USER:-smsuser}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-smspass123}
+      # ProxySQL 监控用户密码（全新实例首启时由 initdb 脚本建 monitor 用户；实际值由 .env/bootstrap 提供）
+      PROXYSQL_MONITOR_PASSWORD: ${PROXYSQL_MONITOR_PASSWORD:-change-me-monitor}
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:3306:3306"   # MySQL：仅本机访问，外部用 SSH 隧道
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./scripts/mysql-initdb/10-monitor-user.sh:/docker-entrypoint-initdb.d/10-monitor-user.sh:ro
+    command: >-
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --character-set-client-handshake=FALSE
+      --default-time-zone=+08:00
+      --max-connections=${MYSQL_MAX_CONNECTIONS:-1000}
+      --range-optimizer-max-mem-size=67108864
+      --innodb-buffer-pool-size=${INNODB_BUFFER_POOL_SIZE:-6G}
+      --innodb-buffer-pool-instances=${INNODB_BUFFER_POOL_INSTANCES:-6}
+      --innodb-log-buffer-size=${INNODB_LOG_BUFFER_SIZE:-64M}
+      --innodb-redo-log-capacity=${INNODB_REDO_LOG_CAPACITY:-2147483648}
+      --innodb-flush-log-at-trx-commit=${INNODB_FLUSH_LOG_AT_TRX_COMMIT:-2}
+      --innodb-flush-method=O_DIRECT
+      --innodb-io-capacity=${INNODB_IO_CAPACITY:-2000}
+      --innodb-io-capacity-max=${INNODB_IO_CAPACITY_MAX:-4000}
+      --innodb-flush-neighbors=0
+      --sync-binlog=${SYNC_BINLOG:-1000}
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-rootpass123}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # 数据库连接池代理
+  proxysql:
+    image: proxysql/proxysql:2.6.3
+    container_name: smsc-proxysql
+    volumes:
+      - ./proxysql.cnf:/etc/proxysql.cnf:ro
+      - proxysql_data:/var/lib/proxysql
+    ports:
+      - "127.0.0.1:6033:6033"   # ProxySQL data：仅本机
+      - "127.0.0.1:6032:6032"   # ProxySQL admin：仅本机（默认 admin/admin 高危！）
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    # 全量 restart 后 MySQL 容器 IP 会变；须确认经 ProxySQL 能真正连上后端，再让 API 起，避免 502
+    healthcheck:
+      test: ["CMD", "sh", "-c", "mysql -h127.0.0.1 -P6033 -usmsuser -p$$MYSQL_PASSWORD -e 'SELECT 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 18
+      start_period: 40s
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # Redis缓存（启用密码鉴权）
+  redis:
+    image: redis:7.0-alpine
+    container_name: smsc-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD} --maxmemory ${REDIS_MAXMEMORY:-1gb} --maxmemory-policy ${REDIS_MAXMEMORY_POLICY:-volatile-lru}
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "sh", "-c", "redis-cli -a $$REDIS_PASSWORD ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # RabbitMQ消息队列（使用非 guest 用户，避免远程连接被拒绝）
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: smsc-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-smsc_mq}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-smsc_mq_pass}
+    ports:
+      - "127.0.0.1:5672:5672"     # AMQP：仅本机
+      - "127.0.0.1:15672:15672"   # 管理界面：仅本机
+      - "127.0.0.1:15692:15692"   # Prometheus 抓取：仅本机
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      # 启用 rabbitmq_prometheus，与 prometheus/prometheus.yml 中 rabbitmq job 一致
+      - ./docker/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins
+      # 生产内存/磁盘保护水位
+      - ./docker/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # Docker Socket 代理：仅给 API/Bot 暴露最小所需的 Docker API
+  # 实际使用：GET /containers/json + GET /containers/{name}/stats + POST /containers/{name}/restart
+  # POST=1 + CONTAINERS=1 是 tecnativa 现有最小组合（没有更细的"仅 restart"开关）
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: smsc-docker-proxy
+    environment:
+      # ========== 允许（业务必需）==========
+      CONTAINERS: 1   # 列容器/查 stats/restart 都属于 /containers/* 路径
+      POST: 1         # 允许 POST（重启需要）
+      # ========== 显式禁止（防御纵深，即便上面打开 POST 也限定到 containers）==========
+      AUTH: 0
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      EVENTS: 0
+      EXEC: 0         # 严禁 exec/attach（容器逃逸跳板）
+      GRPC: 0
+      IMAGES: 0       # 不允许 pull/build/tag 镜像
+      INFO: 0
+      NETWORKS: 0     # 不允许改网络
+      NODES: 0
+      PING: 1         # 健康探测可用
+      PLUGINS: 0
+      SECRETS: 0
+      SERVICES: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      TASKS: 0
+      VERSION: 0
+      VOLUMES: 0      # 不允许操作卷
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro   # socket 只读挂载
+    read_only: true   # 容器自身根文件系统只读
+    tmpfs:
+      - /tmp          # haproxy/socat 临时空间
+      - /run          # haproxy 需要写 /run/haproxy.pid 等
+      - /var/lib/haproxy
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # API服务
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: smsc-api
+    environment:
+      TZ: Asia/Shanghai
+      APP_ENV: ${APP_ENV:-development}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      DATABASE_HOST: proxysql
+      DATABASE_PORT: 6033
+      DATABASE_USER: ${MYSQL_USER:-smsuser}
+      DATABASE_PASSWORD: ${MYSQL_PASSWORD:-smspass123}
+      DATABASE_NAME: ${MYSQL_DATABASE:-sms_system}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-smsc_mq}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-smsc_mq_pass}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ADMIN_GROUP_ID: ${TELEGRAM_ADMIN_GROUP_ID:-}
+      DLR_CALLBACK_OPEN: ${DLR_CALLBACK_OPEN:-false}
+      DLR_CALLBACK_TOKEN: ${DLR_CALLBACK_TOKEN:-}
+      DLR_CALLBACK_IP_WHITELIST: ${DLR_CALLBACK_IP_WHITELIST:-}
+      TELEGRAM_STAFF_API_SECRET: ${TELEGRAM_STAFF_API_SECRET:-}
+      # 游客户服：无在职员工 tg_username 时 internal_bot 兜底跳转（与 Bot 侧 TELEGRAM_CS_FALLBACK_URL 可同值）
+      TELEGRAM_CS_FALLBACK_URL: ${TELEGRAM_CS_FALLBACK_URL:-https://t.me/kaolachbot}
+      PUBLIC_WEB_BASE_URL: ${PUBLIC_WEB_BASE_URL:-https://www.kaolach.com}
+      DOCKER_PROXY_URL: http://docker-proxy:2375
+      SMPP_GATEWAY_PROBE_URL: ${SMPP_GATEWAY_PROBE_URL:-http://smpp-gateway:8090}
+      SMPP_PROBE_TOKEN: ${SMPP_PROBE_TOKEN:-}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-}
+      # 工单附件存储：默认值是 path 拼接 bug 的产物（/data/tickets），显式指定容器内路径
+      TICKET_UPLOAD_DIR: /app/data/tickets
+      # 批次 CSV 上传：复用 import_uploads 命名卷
+      BATCH_UPLOAD_DIR: /tmp/smsc_imports
+      # OKCC 调用 SSL verify：默认 true（安全），改 false 仅当上游证书自签
+      VOS_HTTP_VERIFY_SSL: ${VOS_HTTP_VERIFY_SSL:-true}
+      # OKCC 语音账户同步开关（false 时 /okcc/sync、/okcc/customers 接口停用）
+      OKCC_BEAT_SYNC_ENABLED: ${OKCC_BEAT_SYNC_ENABLED:-true}
+    ports:
+      - "127.0.0.1:8000:8000"   # API：仅本机；前端 nginx 经 docker network 内部访问
+    volumes:
+      - ./backend:/app
+      # 软件授权机器指纹：挂宿主 machine-id，保证容器内指纹稳定且唯一标识本机
+      - /etc/machine-id:/etc/host-machine-id:ro
+      # customer.py 等写入 /var/smsc/.cursor/，挂载后日志落在工作区而非仅容器内
+      - ./.cursor:/var/smsc/.cursor
+      - ./data:/app/data:ro
+      - ./data/knowledge:/app/data/knowledge
+      - ./data/tickets:/app/data/tickets
+      - ./logs:/app/logs
+      - import_uploads:/tmp/smsc_imports
+      # 私库异步上传：API 写临时文件与 Worker 读文件必须同卷，否则跨容器路径不可见
+      - private_library_uploads:/tmp/smsc_pl_uploads
+      # 短链 SSL 证书：admin 通过 UI 上传 PEM/KEY 写入此目录，与 frontend nginx 同卷共享
+      # 子目录 domains/ 存放「一域名一证书」模型下每个域名的独立证书
+      - ./certs:/etc/nginx/certs
+      # 短链「一域名一证书」对应的 nginx server 块片段（每域名一个 .conf）
+      - ./nginx_snippets:/etc/nginx/short_link_snippets
+    depends_on:
+      mysql:
+        condition: service_healthy
+      proxysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      docker-proxy:
+        condition: service_started
+      smpp-gateway:
+        condition: service_started
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # Celery Worker (短信发送)
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: smsc-worker
+    environment:
+      TZ: Asia/Shanghai
+      APP_ENV: ${APP_ENV:-development}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      DATABASE_HOST: proxysql
+      DATABASE_PORT: 6033
+      DATABASE_USER: ${MYSQL_USER:-smsuser}
+      DATABASE_PASSWORD: ${MYSQL_PASSWORD:-smspass123}
+      DATABASE_NAME: ${MYSQL_DATABASE:-sms_system}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-smsc_mq}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-smsc_mq_pass}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-}
+      DLR_SENT_TIMEOUT_HOURS: ${DLR_SENT_TIMEOUT_HOURS:-72}
+      DLR_PULL_HTTP_TIMEOUT_SECONDS: ${DLR_PULL_HTTP_TIMEOUT_SECONDS:-60}
+      # OKCC 语音余额全量同步：Beat 调度，由此 Worker 执行（队列 integrations）
+      OKCC_BEAT_SYNC_ENABLED: ${OKCC_BEAT_SYNC_ENABLED:-true}
+      OKCC_BEAT_SYNC_INTERVAL_SECONDS: ${OKCC_BEAT_SYNC_INTERVAL_SECONDS:-300}
+      # 批次巡检：Go 异步回写时放宽卡死/孤儿判定（分钟，与 batch_inspector 一致）
+      BATCH_INSPECT_STUCK_MINUTES: ${BATCH_INSPECT_STUCK_MINUTES:-30}
+      BATCH_INSPECT_SMPP_ORPHAN_MINUTES: ${BATCH_INSPECT_SMPP_ORPHAN_MINUTES:-30}
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+      - import_uploads:/tmp/smsc_imports
+      - private_library_uploads:/tmp/smsc_pl_uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=${WORKER_CONCURRENCY:-8} --max-tasks-per-child=${WORKER_MAX_TASKS_PER_CHILD:-1000} -Q celery,data_tasks,webhook_tasks,integrations
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # 专用：仅消费 sms_dlr（DLR 回执），与业务 worker 物理隔离，DLR 洪峰不影响 webhook/data 任务
+  worker-dlr:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: smsc-worker-dlr
+    environment:
+      TZ: Asia/Shanghai
+      APP_ENV: ${APP_ENV:-development}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      DATABASE_HOST: proxysql
+      DATABASE_PORT: 6033
+      DATABASE_USER: ${MYSQL_USER:-smsuser}
+      DATABASE_PASSWORD: ${MYSQL_PASSWORD:-smspass123}
+      DATABASE_NAME: ${MYSQL_DATABASE:-sms_system}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-smsc_mq}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-smsc_mq_pass}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-}
+      SMPP_PROBE_TOKEN: ${SMPP_PROBE_TOKEN:-}
+      DLR_SENT_TIMEOUT_HOURS: ${DLR_SENT_TIMEOUT_HOURS:-72}
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=${DLR_WORKER_CONCURRENCY:-8} --max-tasks-per-child=${DLR_WORKER_MAX_TASKS_PER_CHILD:-2000} -Q sms_dlr
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # 专用：仅消费 sms_result_queue（Go SubmitSM 异步回写），与通用 worker 物理隔离，避免被 DLR/批量任务挤占
+  worker-result:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: smsc-worker-result
+    environment:
+      TZ: Asia/Shanghai
+      APP_ENV: ${APP_ENV:-development}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      DATABASE_HOST: proxysql
+      DATABASE_PORT: 6033
+      DATABASE_USER: ${MYSQL_USER:-smsuser}
+      DATABASE_PASSWORD: ${MYSQL_PASSWORD:-smspass123}
+      DATABASE_NAME: ${MYSQL_DATABASE:-sms_system}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-smsc_mq}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-smsc_mq_pass}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-}
+      SMPP_PROBE_TOKEN: ${SMPP_PROBE_TOKEN:-}
+      DLR_SENT_TIMEOUT_HOURS: ${DLR_SENT_TIMEOUT_HOURS:-72}
+      DLR_PULL_HTTP_TIMEOUT_SECONDS: ${DLR_PULL_HTTP_TIMEOUT_SECONDS:-60}
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=${RESULT_WORKER_CONCURRENCY:-12} --max-tasks-per-child=${RESULT_WORKER_MAX_TASKS_PER_CHILD:-2000} -Q sms_result_queue
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # 专用短信发送 Worker（仅 sms_send，与数据/结算任务隔离）
+  worker-sms:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: smsc-worker-sms
+    environment:
+      TZ: Asia/Shanghai
+      APP_ENV: ${APP_ENV:-development}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      DATABASE_HOST: proxysql
+      DATABASE_PORT: 6033
+      DATABASE_USER: ${MYSQL_USER:-smsuser}
+      DATABASE_PASSWORD: ${MYSQL_PASSWORD:-smspass123}
+      DATABASE_NAME: ${MYSQL_DATABASE:-sms_system}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-smsc_mq}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-smsc_mq_pass}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-}
+      SMPP_PROBE_TOKEN: ${SMPP_PROBE_TOKEN:-}
+      # submit_sm 等待 submit_sm_resp 最长时间（秒）；Compose 从项目根目录 .env 注入，见 SMPP_SUBMIT_RESP_WAIT_SECONDS
+      SMPP_SUBMIT_RESP_WAIT_SECONDS: ${SMPP_SUBMIT_RESP_WAIT_SECONDS:-8}
+      # 发送后保持 SMPP 连接秒数以便接收 deliver_sm（最大 86400；更久依赖 HTTP 拉取/回调）
+      SMPP_DLR_SOCKET_HOLD_SECONDS: ${SMPP_DLR_SOCKET_HOLD_SECONDS:-300}
+      DLR_SENT_TIMEOUT_HOURS: ${DLR_SENT_TIMEOUT_HOURS:-72}
+      DLR_PULL_HTTP_TIMEOUT_SECONDS: ${DLR_PULL_HTTP_TIMEOUT_SECONDS:-60}
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+      - import_uploads:/tmp/smsc_imports
+      # 软件授权机器指纹：与 api 一致，保证 worker 验签指纹相同
+      - /etc/machine-id:/etc/host-machine-id:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    # HTTP 通道高并发；SMPP 通道受连接限制需单独评估
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=${SMS_WORKER_CONCURRENCY:-32} --max-tasks-per-child=${SMS_WORKER_MAX_TASKS_PER_CHILD:-2000} -Q sms_send
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # Celery Beat (定时任务调度)
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: smsc-beat
+    environment:
+      TZ: Asia/Shanghai
+      APP_ENV: ${APP_ENV:-development}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      DATABASE_HOST: proxysql
+      DATABASE_PORT: 6033
+      DATABASE_USER: ${MYSQL_USER:-smsuser}
+      DATABASE_PASSWORD: ${MYSQL_PASSWORD:-smspass123}
+      DATABASE_NAME: ${MYSQL_DATABASE:-sms_system}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-smsc_mq}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-smsc_mq_pass}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-}
+      OKCC_BEAT_SYNC_ENABLED: ${OKCC_BEAT_SYNC_ENABLED:-true}
+      OKCC_BEAT_SYNC_INTERVAL_SECONDS: ${OKCC_BEAT_SYNC_INTERVAL_SECONDS:-300}
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # Telegram Bot
+  bot:
+    build:
+      context: ./telegram_bot
+      dockerfile: Dockerfile
+    container_name: smsc-bot
+    environment:
+      TZ: Asia/Shanghai
+      APP_ENV: ${APP_ENV:-development}
+      DATABASE_HOST: proxysql
+      DATABASE_PORT: 6033
+      DATABASE_USER: ${MYSQL_USER:-smsuser}
+      DATABASE_PASSWORD: ${MYSQL_PASSWORD:-smspass123}
+      DATABASE_NAME: ${MYSQL_DATABASE:-sms_system}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-kaolachbot}
+      TELEGRAM_ADMIN_GROUP_ID: ${TELEGRAM_ADMIN_GROUP_ID:-}
+      STAFF_GROUP_ID: ${STAFF_GROUP_ID:-}
+      API_BASE_URL: http://api:8000
+      TELEGRAM_STAFF_API_SECRET: ${TELEGRAM_STAFF_API_SECRET:-}
+      # 游客户服按钮：API 失败或未配置轮询员工时的 t.me 链接（须 https）
+      TELEGRAM_CS_FALLBACK_URL: ${TELEGRAM_CS_FALLBACK_URL:-https://t.me/kaolachbot}
+      # bot_data.pickle 加密 key（Fernet）
+      BOT_PERSISTENCE_KEY: ${BOT_PERSISTENCE_KEY:-}
+    volumes:
+      - ./telegram_bot:/app
+      - ./backend:/backend # 挂载 backend 代码以供复用
+      - ./data/knowledge:/app/data/knowledge:ro # 业务知识附件供下载
+      - ./logs:/app/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: python -m bot.main
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # 官网落地站快照（astercc518/kaolach）：供 Nginx 反代，替换原 Vue Landing 根路径体验
+  landing-preview:
+    build:
+      context: ./deploy/landing-preview
+      dockerfile: Dockerfile
+    image: smsc-landing-preview:latest
+    container_name: smsc-landing-preview
+    environment:
+      TZ: Asia/Shanghai
+      PREVIEW_BIND: "0.0.0.0"
+      PORT: "8787"
+      PREVIEW_BRAND_NAME: kaolach
+      LIVE_ORIGIN: "https://illyvoip.com"
+      PREVIEW_PROXY_MISS: "1"
+      PREVIEW_COOKIEYES_PROXY: "0"
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # 前端服务
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: smsc-frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./certs:/etc/nginx/certs:ro
+      - ./nginx_snippets:/etc/nginx/short_link_snippets:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      landing-preview:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # Playwright 注水 Worker（无头浏览器自动点击/注册）
+  worker-web:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.playwright
+    container_name: smsc-worker-web
+    environment:
+      TZ: Asia/Shanghai
+      APP_ENV: ${APP_ENV:-development}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      DATABASE_HOST: proxysql
+      DATABASE_PORT: 6033
+      DATABASE_USER: ${MYSQL_USER:-smsuser}
+      DATABASE_PASSWORD: ${MYSQL_PASSWORD:-smspass123}
+      DATABASE_NAME: ${MYSQL_DATABASE:-sms_system}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-smsc_mq}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-smsc_mq_pass}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-}
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app worker --loglevel=info --pool=prefork --concurrency=4 --max-tasks-per-child=${WEB_WORKER_MAX_TASKS_PER_CHILD:-500} -Q web_automation
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+  # 高并发 Go SMPP 网关 (Phase 2 优化)
+  smpp-gateway:
+    build:
+      context: ./go-smpp-gateway
+      dockerfile: Dockerfile
+    container_name: smsc-smpp-gateway
+    environment:
+      TZ: Asia/Shanghai
+      DATABASE_HOST: proxysql
+      DATABASE_PORT: 6033
+      DATABASE_USER: ${MYSQL_USER:-smsuser}
+      DATABASE_PASSWORD: ${MYSQL_PASSWORD:-smspass123}
+      DATABASE_NAME: ${MYSQL_DATABASE:-sms_system}
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-smsc_mq}:${RABBITMQ_PASSWORD:-smsc_mq_pass}@rabbitmq:5672/
+      # Go 网关消费 sms_send_smpp：并行 worker 数与 Rabbit QoS prefetch（与 channels.concurrency 配合调压）
+      SMPP_GATEWAY_WORKERS: ${SMPP_GATEWAY_WORKERS:-32}
+      SMPP_GATEWAY_PREFETCH: ${SMPP_GATEWAY_PREFETCH:-32}
+      SMPP_PROBE_BIND_LISTEN: ${SMPP_PROBE_BIND_LISTEN:-:8090}
+      SMPP_PROBE_TOKEN: ${SMPP_PROBE_TOKEN:-}
+      # SMPP 入站服务器
+      BACKEND_INTERNAL_URL: http://api:8000
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-}
+      INBOUND_LISTEN: ${INBOUND_LISTEN:-:2775}
+      INBOUND_SUBMIT_WORKERS: ${INBOUND_SUBMIT_WORKERS:-8}
+      INBOUND_MAX_BINDS_PER_ACCOUNT: ${INBOUND_MAX_BINDS_PER_ACCOUNT:-5}
+      INBOUND_MAX_CONNS_PER_IP: ${INBOUND_MAX_CONNS_PER_IP:-20}
+      # DLR 归属过滤：与外部系统共用同一上游 SMPP 账号时启用，过滤掉别人的 DLR
+      DLR_OWNERSHIP_FILTER: ${DLR_OWNERSHIP_FILTER:-true}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    ports:
+      - "2775:2775"
+    depends_on:
+      proxysql:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    # Graceful shutdown：网关收到 SIGTERM 后需排空 prefetch=32 的 in-flight RabbitMQ delivery
+    # 再 Ack 退出；否则 RabbitMQ 会把已 submit 给上游的 payload 重新 requeue 导致重复计费。
+    # 60s 大于 main.go 内 ctx 等待超时（60s），留出本地排空 + ack 的余量。
+    stop_grace_period: 90s
+    logging: *default-logging
+    networks:
+      - smsc-network
+
+
+volumes:
+  mysql_data:
+    driver: local
+  redis_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  import_uploads:
+    driver: local
+  private_library_uploads:
+    driver: local
+  proxysql_data:
+    driver: local
+
+networks:
+  smsc-network:
+    driver: bridge

@@ -1,0 +1,80 @@
+# 环境与密钥
+.env
+.env.*
+!.env.example
+*.pem
+certs/
+
+# 短链：admin 上传证书后由后端自动生成的 nginx server 块片段（运行时数据）
+nginx_snippets/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+*.local
+
+# 落地站：若本地 git clone 调试，勿提交大体积快照（生产用 deploy/landing-preview Dockerfile 构建）
+/landing-kaolach/
+
+# 日志与备份
+scripts/backups/
+logs/
+*.log
+*.tar.gz
+*.bak
+*.new
+*.rollback
+.backup_migrate/
+celerybeat-schedule
+bot_data.pickle
+
+# 散落的临时调试脚本（应放 scripts/ops/ 或 tests/）
+backend/test_*.py
+backend/debug_*.py
+backend/check_*.py
+
+# IDE / 编辑器
+.cursor/
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 测试与覆盖率
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Go 网关本地构建二进制（勿提交）
+/go-smpp-gateway/go-smpp-gateway
+
+# PDF 生成用中文字体（约 8MB，运行 backend/scripts/md2pdf.py 时自动下载）
+backend/scripts/fonts/*.otf
+backend/scripts/fonts/*.ttf
+
+# License 私钥等敏感文件,严禁入库
+.secrets/
+
+# 由 bootstrap/rotate 从 proxysql.cnf.template 渲染（含密码，勿入库）
+proxysql.cnf

@@ -1,0 +1,146 @@
+"""
+短信相关的数据模式
+"""
+from datetime import datetime
+from typing import Optional
+from pydantic import BaseModel, Field, validator
+
+
+class SMSSendRequest(BaseModel):
+    """发送短信请求"""
+    phone_number: str = Field(..., description="目标电话号码（E.164格式，如+8613800138000）")
+    message: str = Field(..., min_length=1, max_length=1000, description="短信内容")
+    sender_id: Optional[str] = Field(None, max_length=20, description="发送方ID（可选）")
+    channel_id: Optional[int] = Field(None, description="指定通道ID（可选）")
+    callback_url: Optional[str] = Field(None, description="状态回调URL（可选）")
+    http_username: Optional[str] = Field(None, max_length=100, description="HTTP通道账户（可选）")
+    http_password: Optional[str] = Field(None, max_length=255, description="HTTP通道密码（可选）")
+    
+    @validator('phone_number')
+    def validate_phone_number(cls, v):
+        """验证电话号码格式"""
+        if not v.startswith('+'):
+            raise ValueError('Phone number must start with + (E.164 format)')
+        if len(v) < 8 or len(v) > 20:
+            raise ValueError('Phone number length must be between 8 and 20')
+        return v
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "phone_number": "+8613800138000",
+                "message": "Your verification code is 123456",
+                "sender_id": "MyApp"
+            }
+        }
+
+
+class SMSSendResponse(BaseModel):
+    """发送短信响应"""
+    success: bool
+    message_id: Optional[str] = None
+    status: Optional[str] = None
+    cost: Optional[float] = None
+    currency: Optional[str] = None
+    message_count: Optional[int] = None
+    error: Optional[dict] = None
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "success": True,
+                "message_id": "msg_1234567890abcdef",
+                "status": "queued",
+                "cost": 0.05,
+                "currency": "USD",
+                "message_count": 1
+            }
+        }
+
+
+class SMSStatusResponse(BaseModel):
+    """短信状态响应"""
+    message_id: str
+    status: str
+    phone_number: str
+    submit_time: str
+    sent_time: Optional[str] = None
+    delivery_time: Optional[str] = None
+    error_message: Optional[str] = None
+    cost: Optional[float] = None
+    currency: Optional[str] = None
+
+
+class BatchSMSRequest(BaseModel):
+    """批量发送短信请求"""
+    phone_numbers: Optional[list[str]] = Field(None, description="电话号码列表（支持百万级）")
+    message: str = Field(..., min_length=1, max_length=1000, description="短信内容（无 messages 时使用；多文案时作占位）")
+    sender_id: Optional[str] = Field(None, max_length=20, description="发送方ID（可选）")
+    callback_url: Optional[str] = Field(None, description="状态回调URL（可选）")
+    channel_id: Optional[int] = Field(None, description="指定通道ID（可选）")
+    batch_name: Optional[str] = Field(None, max_length=200, description="发送任务名称（可选，用于任务列表展示）")
+    messages: Optional[list[str]] = Field(None, description="多文案按号码轮发；非空时按序号取模选用")
+    private_library_filters: Optional[dict] = Field(
+        None,
+        description="私有库过滤条件：country_code, source, purpose, batch_id（强烈建议传，与同卡片一致）, carrier, limit, unused_only",
+    )
+    scheduled_at: Optional[datetime] = Field(None, description="定时发送时间（不传或为 null 则立即发送）")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "phone_numbers": ["+8613800138000", "+8613800138001"],
+                "message": "Batch message content",
+                "sender_id": "MyApp"
+            }
+        }
+
+
+class BatchSMSResponse(BaseModel):
+    """批量发送短信响应"""
+    success: bool
+    total: int
+    succeeded: int
+    failed: int
+    messages: list[dict]
+    batch_id: Optional[int] = Field(None, description="关联 sms_batches.id，可在发送任务页查看进度")
+    async_processing: bool = Field(False, description="大批量异步处理中，succeeded 暂为 0 属正常")
+    # 无号码入队等场景下供前端展示（如私库筛选结果为空、limit≤0）
+    error: Optional[dict] = Field(None, description='{"code": "...", "message": "..."}')
+
+
+class SMSApprovalSubmitRequest(BaseModel):
+    """短信审核提交请求（仅需文案；号码可选，业务助手审过后再发）"""
+    message: str = Field(..., min_length=1, max_length=1000, description="短信内容")
+    phone_number: Optional[str] = Field(None, description="可选目标号码 E.164")
+
+    @validator('phone_number', always=True)
+    def validate_phone_optional(cls, v):
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        v = str(v).strip()
+        if not v.startswith('+'):
+            raise ValueError('Phone number must start with + (E.164 format)')
+        if len(v) < 8 or len(v) > 20:
+            raise ValueError('Phone number length must be between 8 and 20')
+        return v
+
+
+class SMSApprovalExecuteRequest(BaseModel):
+    """执行审核通过后的发送：审核记录无号码时（如 Bot 仅文案）可在此补传"""
+    phone_number: Optional[str] = Field(None, description="接收号码 E.164；仅当审核记录未保存号码时需要")
+
+
+class PublicSMSRate(BaseModel):
+    """公开短信费率"""
+    code: str = Field(..., description="国家/地区代码 (ISO 2-letter)")
+    name: str = Field(..., description="国家/地区名称")
+    price: float = Field(..., description="公开售价 (USD)")
+    dial_code: Optional[str] = Field(None, description="国际区号")
+
+
+class PublicSMSRateResponse(BaseModel):
+    """公开短信费率响应"""
+    success: bool
+    data: list[PublicSMSRate]
+

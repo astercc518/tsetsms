@@ -1,0 +1,1350 @@
+"""
+短链相关 API：域名管理（admin）+ 客户域名下拉 + 批次点击统计 + 提取已点击号码
+
+路由分布：
+- /api/v1/admin/short-link-domains*  — admin CRUD
+- /api/v1/short-link-domains          — 客户/admin 共用，仅返回 active 列表
+- /api/v1/sms/batches/{id}/click-stats         — 批次点击概览
+- /api/v1/sms/batches/{id}/clicked-phones      — 已点击号码列表（JSON 预览）
+- /api/v1/sms/batches/{id}/clicked-phones.csv  — CSV 下载
+"""
+import csv
+import io
+from datetime import datetime
+from typing import Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import and_, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.v1.admin import get_current_admin
+from app.core.auth import AuthService, get_current_account
+from app.database import get_db
+from app.modules.common.account import Account
+from app.modules.common.admin_user import AdminUser
+from app.modules.sms.short_link_domain import ShortLinkDomain
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
+from app.modules.sms.short_link_log import ShortLinkLog
+from app.modules.sms.short_link_click import ShortLinkClick
+from app.modules.sms.sms_log import SMSLog
+
+
+# =============================================================================
+# Pydantic
+# =============================================================================
+
+class DomainCreate(BaseModel):
+    domain: str = Field(..., max_length=255)
+    base_path: str = Field("/s", max_length=64)
+    scheme: str = Field("https", max_length=8)
+    omit_scheme: bool = False
+    remark: Optional[str] = Field(None, max_length=255)
+    status: str = Field("active")
+    sort_order: int = 0
+
+
+class DomainUpdate(BaseModel):
+    domain: Optional[str] = Field(None, max_length=255)
+    base_path: Optional[str] = Field(None, max_length=64)
+    scheme: Optional[str] = Field(None, max_length=8)
+    omit_scheme: Optional[bool] = None
+    remark: Optional[str] = Field(None, max_length=255)
+    status: Optional[str] = None
+    sort_order: Optional[int] = None
+
+
+class DomainOut(BaseModel):
+    id: int
+    domain: str
+    base_path: str
+    scheme: str
+    omit_scheme: bool
+    remark: Optional[str]
+    status: str
+    sort_order: int
+    base_url: str
+
+    @classmethod
+    def from_orm_obj(cls, d: ShortLinkDomain) -> "DomainOut":
+        return cls(
+            id=d.id,
+            domain=d.domain,
+            base_path=d.base_path,
+            scheme=d.scheme,
+            omit_scheme=bool(d.omit_scheme),
+            remark=d.remark,
+            status=d.status,
+            sort_order=d.sort_order,
+            base_url=d.base_url(),
+        )
+
+
+# =============================================================================
+# Admin: 域名 CRUD（super_admin 限定）
+# =============================================================================
+
+admin_router = APIRouter(prefix="/admin/short-link-domains", tags=["短链域名管理"])
+
+
+def _require_super_admin(admin: AdminUser):
+    if (admin.role or "") not in ("super_admin",):
+        raise HTTPException(status_code=403, detail="仅 super_admin 可操作")
+
+
+@admin_router.get("")
+async def list_domains(
+    keyword: Optional[str] = None,
+    status: Optional[str] = None,
+    with_stats: bool = False,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminUser = Depends(get_current_admin),
+):
+    """
+    列表查询；with_stats=true 时附带 per-domain 统计：
+        link_count   该域名累计生成多少条短链
+        total_clicks 该域名累计被点击多少次
+        last_used_at 最近一次生成短链的时间
+    历史 NULL domain_id 的记录不计入任何域名（属于"未关联"）。
+    """
+    stmt = select(ShortLinkDomain)
+    conds = []
+    if keyword:
+        kw = f"%{keyword}%"
+        conds.append(ShortLinkDomain.domain.like(kw))
+    if status:
+        conds.append(ShortLinkDomain.status == status)
+    if conds:
+        stmt = stmt.where(and_(*conds))
+    stmt = stmt.order_by(ShortLinkDomain.sort_order.desc(), ShortLinkDomain.id.desc())
+    rows = (await db.execute(stmt)).scalars().all()
+
+    stats_map: dict = {}
+    if with_stats and rows:
+        # 一次性聚合，命中 (domain_id, created_at) 复合索引
+        agg = (
+            await db.execute(
+                select(
+                    ShortLinkLog.domain_id,
+                    func.count().label("link_count"),
+                    func.coalesce(func.sum(ShortLinkLog.click_count), 0).label("total_clicks"),
+                    func.max(ShortLinkLog.created_at).label("last_used_at"),
+                )
+                .where(ShortLinkLog.domain_id.in_([r.id for r in rows]))
+                .group_by(ShortLinkLog.domain_id)
+            )
+        ).all()
+        for row in agg:
+            stats_map[row.domain_id] = {
+                "link_count": int(row.link_count or 0),
+                "total_clicks": int(row.total_clicks or 0),
+                "last_used_at": row.last_used_at.isoformat() if row.last_used_at else None,
+            }
+
+    out = []
+    for r in rows:
+        item = DomainOut.from_orm_obj(r).model_dump()
+        if with_stats:
+            s = stats_map.get(r.id, {"link_count": 0, "total_clicks": 0, "last_used_at": None})
+            item.update(s)
+        out.append(item)
+    return {"success": True, "data": out}
+
+
+@admin_router.post("")
+async def create_domain(
+    payload: DomainCreate,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminUser = Depends(get_current_admin),
+):
+    _require_super_admin(admin)
+    domain = (payload.domain or "").strip().lower()
+    if not domain or "/" in domain:
+        raise HTTPException(status_code=400, detail="域名不合法")
+
+    exists = (
+        await db.execute(select(ShortLinkDomain.id).where(ShortLinkDomain.domain == domain))
+    ).scalar_one_or_none()
+    if exists:
+        raise HTTPException(status_code=400, detail="域名已存在")
+
+    row = ShortLinkDomain(
+        domain=domain,
+        # base_path 允许显式空串（即 "无前缀，最省字符"）
+        base_path=(payload.base_path if payload.base_path is not None else "/s").strip(),
+        scheme=(payload.scheme or "https").strip().lower(),
+        omit_scheme=bool(payload.omit_scheme),
+        remark=payload.remark,
+        status=payload.status if payload.status in ("active", "disabled") else "active",
+        sort_order=payload.sort_order or 0,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return {"success": True, "data": DomainOut.from_orm_obj(row).model_dump()}
+
+
+@admin_router.put("/{domain_id}")
+async def update_domain(
+    domain_id: int,
+    payload: DomainUpdate,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminUser = Depends(get_current_admin),
+):
+    _require_super_admin(admin)
+    row = (
+        await db.execute(select(ShortLinkDomain).where(ShortLinkDomain.id == domain_id))
+    ).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="域名不存在")
+
+    if payload.domain is not None:
+        new_domain = payload.domain.strip().lower()
+        if not new_domain or "/" in new_domain:
+            raise HTTPException(status_code=400, detail="域名不合法")
+        if new_domain != row.domain:
+            dup = (
+                await db.execute(
+                    select(ShortLinkDomain.id).where(ShortLinkDomain.domain == new_domain)
+                )
+            ).scalar_one_or_none()
+            if dup:
+                raise HTTPException(status_code=400, detail="域名已存在")
+            row.domain = new_domain
+    if payload.base_path is not None:
+        # 允许显式空串
+        row.base_path = payload.base_path.strip()
+    if payload.scheme is not None:
+        row.scheme = payload.scheme.strip().lower() or "https"
+    if payload.omit_scheme is not None:
+        row.omit_scheme = bool(payload.omit_scheme)
+    if payload.remark is not None:
+        row.remark = payload.remark
+    if payload.status is not None and payload.status in ("active", "disabled"):
+        row.status = payload.status
+    if payload.sort_order is not None:
+        row.sort_order = int(payload.sort_order)
+
+    await db.commit()
+    await db.refresh(row)
+    return {"success": True, "data": DomainOut.from_orm_obj(row).model_dump()}
+
+
+@admin_router.delete("/{domain_id}")
+async def delete_domain(
+    domain_id: int,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminUser = Depends(get_current_admin),
+):
+    _require_super_admin(admin)
+    row = (
+        await db.execute(select(ShortLinkDomain).where(ShortLinkDomain.id == domain_id))
+    ).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="域名不存在")
+    await db.delete(row)
+    await db.commit()
+    return {"success": True}
+
+
+# =============================================================================
+# 短链 SSL 证书：上传 + 查询当前 + 一键 reload nginx
+# =============================================================================
+
+import os
+import tempfile
+from pathlib import Path
+import httpx
+from pydantic import BaseModel as _BaseModel
+
+from app.utils.ssl_cert import (
+    CertValidationError,
+    validate_cert_and_key,
+    parse_cert,
+    cert_summary,
+)
+
+# 容器内挂载点（与 docker-compose.yml 一致）
+_CERT_DIR = Path("/etc/nginx/certs")
+_CERT_PEM = _CERT_DIR / "short.pem"        # 旧版多 SAN 大证书（兼容路径）
+_CERT_KEY = _CERT_DIR / "short.key"
+_PER_DOMAIN_CERT_DIR = _CERT_DIR / "domains"             # 一域名一证书的存放目录
+_NGINX_SNIPPET_DIR = Path("/etc/nginx/short_link_snippets")
+_FRONTEND_CONTAINER = "smsc-frontend"
+
+
+def _per_domain_pem_path(domain_id: int) -> Path:
+    return _PER_DOMAIN_CERT_DIR / f"{int(domain_id)}.pem"
+
+
+def _per_domain_key_path(domain_id: int) -> Path:
+    return _PER_DOMAIN_CERT_DIR / f"{int(domain_id)}.key"
+
+
+def _per_domain_snippet_path(domain_id: int) -> Path:
+    return _NGINX_SNIPPET_DIR / f"{int(domain_id)}.conf"
+
+
+def _render_nginx_snippet(domain_id: int, domain: str) -> str:
+    """
+    为每个上传了专属证书的域名生成 nginx server 块片段。
+    精确 server_name 优先级高于 catch-all 的 ~.+ 正则，保证流量打到这里。
+    """
+    return f"""# 自动生成 — 短链域名 {domain} 专属证书 server 块（domain_id={domain_id}）
+server {{
+    listen 80;
+    listen 443 ssl http2;
+    server_name {domain} *.{domain};
+
+    ssl_certificate     /etc/nginx/certs/domains/{domain_id}.pem;
+    ssl_certificate_key /etc/nginx/certs/domains/{domain_id}.key;
+
+    # CF 真实客户端 IP
+    set_real_ip_from 0.0.0.0/0;
+    real_ip_header CF-Connecting-IP;
+
+    # 短链域名落地页：不暴露 Kaolach 关联，但呈现自洽内容，
+    # 避免运营商/反垃圾扫描器把根路径空壳判定为可疑域名
+    root /usr/share/nginx/shortlink_landing;
+    index index.html;
+
+    location = / {{
+        try_files /index.html =200;
+        add_header Cache-Control "public, max-age=3600" always;
+        add_header X-Robots-Tag "noindex, nofollow" always;
+        add_header Referrer-Policy "no-referrer" always;
+    }}
+
+    # 隐私 / 条款 / 联系页：让"看似正经的小站"骨架完整
+    location = /privacy {{ try_files /privacy.html =404; add_header X-Robots-Tag "noindex, nofollow" always; }}
+    location = /terms   {{ try_files /terms.html   =404; add_header X-Robots-Tag "noindex, nofollow" always; }}
+    location = /contact {{ try_files /contact.html =404; add_header X-Robots-Tag "noindex, nofollow" always; }}
+    location = /robots.txt {{ try_files /robots.txt =404; access_log off; }}
+    location = /favicon.ico {{ try_files /favicon.ico =204; access_log off; log_not_found off; }}
+
+    # 健康检查
+    location = /health {{
+        access_log off;
+        return 200 "ok\\n";
+    }}
+
+    # 路径 A（兼容传统）：{domain}/s/{{token}}
+    location ^~ /s/ {{
+        proxy_pass http://api:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_read_timeout 30s;
+        proxy_connect_timeout 10s;
+    }}
+
+    # 路径 B（裸 token，省字符）：{domain}/{{token}}
+    location ~ "^/([A-Za-z0-9]{{6,8}})$" {{
+        rewrite ^/(.+)$ /s/$1 break;
+        proxy_pass http://api:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_read_timeout 30s;
+        proxy_connect_timeout 10s;
+    }}
+
+    # 其他路径返回 404，避免被扫描收录
+    location / {{ return 404; }}
+}}
+"""
+
+
+class CertUploadPayload(_BaseModel):
+    cert_pem: str
+    key_pem: str
+
+
+def _atomic_write(path: Path, content: str, mode: int) -> None:
+    """先写入临时文件，rename 替换；避免 nginx 在 reload 瞬间读到半截内容。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".upload_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+async def _reload_nginx() -> Dict:
+    """
+    通过 docker-socket-proxy 给 frontend 容器发 SIGHUP，nginx 平滑 reload。
+
+    带 3 次重试 + 指数退避，避免连续上传多个证书时 docker-proxy 偶发抖动导致 UI 误报失败。
+    nginx 收到 SIGHUP 是幂等的（重复发送只是再触发一次 graceful reload，无副作用）。
+    """
+    import asyncio as _aio
+    proxy_url = os.getenv("DOCKER_PROXY_URL", "http://docker-proxy:2375")
+    url = f"{proxy_url}/containers/{_FRONTEND_CONTAINER}/kill?signal=HUP"
+    last_err: str = ""
+    last_status: int = 0
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(url)
+            if resp.status_code in (204, 200):
+                return {"success": True, "method": "SIGHUP", "attempts": attempt + 1}
+            last_status = resp.status_code
+            last_err = (resp.text or "")[:300]
+        except Exception as e:
+            last_err = str(e)
+        if attempt < 2:
+            await _aio.sleep(0.5 * (attempt + 1))  # 0.5s, 1.0s
+    return {
+        "success": False,
+        "method": "SIGHUP",
+        "status_code": last_status,
+        "error": last_err,
+        "attempts": 3,
+    }
+
+
+@admin_router.get("/cert/info")
+async def get_cert_info(admin: AdminUser = Depends(get_current_admin)):
+    """
+    返回当前 short.pem 信息（SAN、有效期等）；
+    若证书文件不存在或解析失败，返回 configured=false 告知前端"未配置"。
+    """
+    if not _CERT_PEM.exists():
+        return {"success": True, "data": {"configured": False, "reason": "证书文件不存在"}}
+    try:
+        pem_text = _CERT_PEM.read_text(encoding="utf-8")
+        cert = parse_cert(pem_text)
+        summary = cert_summary(cert)
+        return {
+            "success": True,
+            "data": {
+                "configured": True,
+                "path": str(_CERT_PEM),
+                "key_path": str(_CERT_KEY),
+                **summary,
+            },
+        }
+    except Exception as e:
+        return {
+            "success": True,
+            "data": {"configured": False, "reason": f"证书解析失败: {e}"},
+        }
+
+
+@admin_router.post("/cert/upload")
+async def upload_cert(
+    payload: CertUploadPayload,
+    admin: AdminUser = Depends(get_current_admin),
+):
+    """
+    上传 PEM + KEY，原子写入磁盘并通过 docker-proxy SIGHUP 平滑 reload nginx。
+    任一校验失败 → 不写文件 / 不 reload。
+    """
+    _require_super_admin(admin)
+
+    cert_pem = (payload.cert_pem or "").strip()
+    key_pem = (payload.key_pem or "").strip()
+    if not cert_pem or not key_pem:
+        raise HTTPException(status_code=400, detail="证书或私钥为空")
+    # 末尾确保有换行（部分 nginx 版本对最后一行无换行的 PEM 容忍度低）
+    if not cert_pem.endswith("\n"):
+        cert_pem += "\n"
+    if not key_pem.endswith("\n"):
+        key_pem += "\n"
+
+    try:
+        cert, summary = validate_cert_and_key(cert_pem, key_pem)
+    except CertValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 写文件（原子）
+    try:
+        _atomic_write(_CERT_PEM, cert_pem, mode=0o644)
+        _atomic_write(_CERT_KEY, key_pem, mode=0o600)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"写入证书失败: {e}")
+
+    # 异步 reload nginx；reload 失败不抹掉证书（可重试），但要返回给前端
+    reload_result = await _reload_nginx()
+
+    return {
+        "success": True,
+        "data": {
+            "cert": summary,
+            "reload": reload_result,
+        },
+    }
+
+
+@admin_router.post("/cert/reload")
+async def manual_reload_nginx(admin: AdminUser = Depends(get_current_admin)):
+    """手动触发 nginx reload，用于上传证书后 reload 失败重试。"""
+    _require_super_admin(admin)
+    return {"success": True, "data": await _reload_nginx()}
+
+
+# =============================================================================
+# 每域名独立证书 (一域名一证书)
+# =============================================================================
+
+@admin_router.get("/{domain_id}/cert/info")
+async def get_domain_cert_info(
+    domain_id: int,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminUser = Depends(get_current_admin),
+):
+    """
+    返回该域名专属证书的状态。
+    若专属证书不存在则 configured=false；前端可显示「未配置 / 上传证书」按钮。
+    """
+    pem_path = _per_domain_pem_path(domain_id)
+    if not pem_path.exists():
+        return {"success": True, "data": {"configured": False, "domain_id": domain_id, "reason": "未上传专属证书"}}
+    try:
+        cert = parse_cert(pem_path.read_text(encoding="utf-8"))
+        summary = cert_summary(cert)
+        return {
+            "success": True,
+            "data": {
+                "configured": True,
+                "domain_id": domain_id,
+                "path": str(pem_path),
+                **summary,
+            },
+        }
+    except Exception as e:
+        return {"success": True, "data": {"configured": False, "domain_id": domain_id, "reason": f"解析失败: {e}"}}
+
+
+@admin_router.post("/{domain_id}/cert/upload")
+async def upload_domain_cert(
+    domain_id: int,
+    payload: CertUploadPayload,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminUser = Depends(get_current_admin),
+):
+    """
+    上传该域名的专属 PEM/KEY，原子写盘 → 生成 nginx snippet → SIGHUP reload。
+
+    校验：
+        - PEM/KEY 格式
+        - KEY 与 cert 公钥指纹一致
+        - 证书未过期
+        - 证书 SAN **必须**包含该 domain（否则 TLS 握手对该域名会失败）
+    """
+    _require_super_admin(admin)
+
+    row = (
+        await db.execute(select(ShortLinkDomain).where(ShortLinkDomain.id == domain_id))
+    ).scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="域名不存在")
+
+    cert_pem = (payload.cert_pem or "").strip()
+    key_pem = (payload.key_pem or "").strip()
+    if not cert_pem or not key_pem:
+        raise HTTPException(status_code=400, detail="证书或私钥为空")
+    if not cert_pem.endswith("\n"): cert_pem += "\n"
+    if not key_pem.endswith("\n"): key_pem += "\n"
+
+    try:
+        cert, summary = validate_cert_and_key(cert_pem, key_pem)
+    except CertValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 强校验：SAN 必须包含本域名（裸名或通配）
+    sans_lower = [s.lower() for s in summary.get("sans", [])]
+    target = row.domain.lower()
+    san_match = (
+        target in sans_lower
+        or f"*.{target}" in sans_lower
+        or any(s.startswith("*.") and target.endswith(s[1:]) for s in sans_lower)
+    )
+    if not san_match:
+        raise HTTPException(
+            status_code=400,
+            detail=f"证书 SAN 不包含 {row.domain}；当前 SAN: {summary.get('sans')}",
+        )
+
+    pem_path = _per_domain_pem_path(domain_id)
+    key_path = _per_domain_key_path(domain_id)
+    snippet_path = _per_domain_snippet_path(domain_id)
+    try:
+        _atomic_write(pem_path, cert_pem, mode=0o644)
+        _atomic_write(key_path, key_pem, mode=0o600)
+        _atomic_write(snippet_path, _render_nginx_snippet(domain_id, row.domain), mode=0o644)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"写入证书或 nginx 片段失败: {e}")
+
+    reload_result = await _reload_nginx()
+    return {
+        "success": True,
+        "data": {
+            "domain": row.domain,
+            "cert": summary,
+            "reload": reload_result,
+        },
+    }
+
+
+@admin_router.delete("/{domain_id}/cert")
+async def delete_domain_cert(
+    domain_id: int,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminUser = Depends(get_current_admin),
+):
+    """删除该域名专属证书 + nginx snippet，并 reload。"""
+    _require_super_admin(admin)
+    pem_path = _per_domain_pem_path(domain_id)
+    key_path = _per_domain_key_path(domain_id)
+    snippet_path = _per_domain_snippet_path(domain_id)
+    removed = []
+    for p in (pem_path, key_path, snippet_path):
+        try:
+            if p.exists():
+                p.unlink()
+                removed.append(p.name)
+        except Exception as e:
+            logger.warning(f"删除文件失败 {p}: {e}")
+    reload_result = await _reload_nginx() if removed else {"success": True, "method": "noop"}
+    return {"success": True, "data": {"removed": removed, "reload": reload_result}}
+
+
+# =============================================================================
+# 短链域名 → 已点击号码导出（按国家筛选）
+#
+# 与 /sms/batches/{batch_id}/clicked-phones.csv 同款数据源（short_link_logs ⋈ sms_logs），
+# 区别在于聚合维度：域名级而非批次级。运营场景：选某个营销短链域名 → 拉某国家点过链
+# 的号码做二次触达。
+# =============================================================================
+
+
+@admin_router.get("/{domain_id}/clicked-countries")
+async def list_clicked_countries(
+    domain_id: int,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminUser = Depends(get_current_admin),
+):
+    """该域名下出现过的国家列表（仅含 click_count>=1 的号码所属国家），供下载弹窗下拉。"""
+    rows = (
+        await db.execute(
+            select(SMSLog.country_code, func.count(func.distinct(SMSLog.phone_number)).label("cnt"))
+            .select_from(ShortLinkLog)
+            .join(SMSLog, SMSLog.id == ShortLinkLog.sms_log_id)
+            .where(ShortLinkLog.domain_id == domain_id, ShortLinkLog.click_count >= 1)
+            .group_by(SMSLog.country_code)
+            .order_by(func.count(func.distinct(SMSLog.phone_number)).desc())
+        )
+    ).all()
+    items = [{"country_code": (cc or "").strip() or "UNKNOWN", "count": int(c or 0)} for cc, c in rows]
+    return {"success": True, "items": items}
+
+
+@admin_router.get("/{domain_id}/clicked-phones")
+async def download_domain_clicked_phones(
+    domain_id: int,
+    fmt: str = Query("txt", regex="^(txt|csv)$"),
+    country_code: Optional[str] = Query(None, max_length=10),
+    db: AsyncSession = Depends(get_db),
+    admin: AdminUser = Depends(get_current_admin),
+):
+    """下载该域名下「真实点击过短链」的号码。
+
+    - fmt=txt：一行一个号码，去重 + 剥前导 `+`
+    - fmt=csv：phone_number,country_code,click_count,last_click_at,original_url
+    - country_code 可选，传则按 sms_logs.country_code 精确匹配（ISO2，大写）
+    """
+    domain = (await db.execute(
+        select(ShortLinkDomain).where(ShortLinkDomain.id == domain_id)
+    )).scalar_one_or_none()
+    if not domain:
+        raise HTTPException(status_code=404, detail="domain_not_found")
+
+    cc_norm = (country_code or "").strip().upper() or None
+
+    # 公共 WHERE
+    base_where = [ShortLinkLog.domain_id == domain_id, ShortLinkLog.click_count >= 1]
+    if cc_norm:
+        base_where.append(SMSLog.country_code == cc_norm)
+
+    # 审计日志必须在创建流式游标之前写入：log_operation 会在同一会话上 flush 一条 INSERT，
+    # 这会让随后 db.stream() 拿到的游标在 StreamingResponse 真正消费时失效（返回 0 行）。
+    try:
+        from app.services.operation_log import log_operation
+        await log_operation(
+            db, admin_id=admin.id, admin_name=admin.username,
+            module="sms", action="short_link_export_clicked_phones",
+            target_type="short_link_domain", target_id=str(domain_id),
+            title=f"下载短链域名 {domain.domain} 点击号码（{cc_norm or 'all'}, {fmt}）",
+            detail={"domain_id": domain_id, "domain": domain.domain, "country_code": cc_norm, "fmt": fmt},
+        )
+    except Exception as e:
+        logger.warning(f"短链域名点击号码下载审计日志写入失败 domain_id={domain_id}: {e}")
+
+    if fmt == "txt":
+        # 仅取去重号码（DISTINCT phone_number），避免一个号码多次点击重复出现
+        rows_iter = await db.stream(
+            select(SMSLog.phone_number)
+            .select_from(ShortLinkLog)
+            .join(SMSLog, SMSLog.id == ShortLinkLog.sms_log_id)
+            .where(*base_where)
+            .distinct()
+        )
+
+        async def gen_txt():
+            seen = 0
+            async for (phone,) in rows_iter:
+                p = (phone or "").lstrip("+")
+                if not p:
+                    continue
+                seen += 1
+                yield p + "\n"
+            if seen == 0:
+                yield ""  # 空 body；前端按 blob.size==0 提示无数据
+
+        suffix = cc_norm or "all"
+        fname = f"clicked_phones_{domain.domain}_{suffix}_{datetime.now().strftime('%Y%m%d%H%M%S')}.txt"
+        resp_factory = StreamingResponse(
+            gen_txt(),
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+    else:  # csv
+        rows_iter = await db.stream(
+            select(
+                SMSLog.phone_number,
+                SMSLog.country_code,
+                ShortLinkLog.click_count,
+                ShortLinkLog.last_click_at,
+                ShortLinkLog.original_url,
+            )
+            .select_from(ShortLinkLog)
+            .join(SMSLog, SMSLog.id == ShortLinkLog.sms_log_id)
+            .where(*base_where)
+            .order_by(ShortLinkLog.last_click_at.desc())
+        )
+
+        async def gen_csv():
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            w.writerow(["phone_number", "country_code", "click_count", "last_click_at", "original_url"])
+            yield buf.getvalue()
+            buf.seek(0); buf.truncate(0)
+
+            async for r in rows_iter:
+                ts = r.last_click_at.isoformat() if r.last_click_at else ""
+                w.writerow([r.phone_number, r.country_code or "", int(r.click_count or 0), ts, r.original_url or ""])
+                data = buf.getvalue()
+                if data:
+                    yield data
+                    buf.seek(0); buf.truncate(0)
+
+        suffix = cc_norm or "all"
+        fname = f"clicked_phones_{domain.domain}_{suffix}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+        resp_factory = StreamingResponse(
+            gen_csv(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+
+    return resp_factory
+
+
+# =============================================================================
+# 客户/管理员共用：仅返回 active 域名（Send 页下拉）
+# =============================================================================
+
+public_router = APIRouter(prefix="/short-link-domains", tags=["短链域名（公开列表）"])
+
+
+@public_router.get("")
+async def list_active_domains(db: AsyncSession = Depends(get_db)):
+    """供「短链转换」对话框下拉。无鉴权强制，但会自动通过现有路由保护。"""
+    rows = (
+        await db.execute(
+            select(ShortLinkDomain)
+            .where(ShortLinkDomain.status == "active")
+            .order_by(ShortLinkDomain.sort_order.desc(), ShortLinkDomain.id.desc())
+        )
+    ).scalars().all()
+    return {"success": True, "data": [DomainOut.from_orm_obj(r).model_dump() for r in rows]}
+
+
+# =============================================================================
+# 批次点击统计 + 提取已点击号码
+# =============================================================================
+
+stats_router = APIRouter(prefix="/sms/batches", tags=["短信批次-短链统计"])
+
+
+def _per_token_clicks_subq(batch_id: int):
+    """每个 token 的点击明细聚合（限定在指定批次的 token 集合上）。
+
+    输出字段：
+      - token
+      - detail_total / detail_human / detail_bot
+      - last_human_at（仅真人点击的最大时间，用于 UI 排序展示）
+
+    把 batch 限制下推到子查询，避免对全表 short_link_clicks 做无谓聚合。
+    """
+    batch_token_subq = (
+        select(ShortLinkLog.token)
+        .join(SMSLog, SMSLog.id == ShortLinkLog.sms_log_id)
+        .where(SMSLog.batch_id == batch_id)
+        .subquery()
+    )
+    return (
+        select(
+            ShortLinkClick.token.label("token"),
+            func.count().label("detail_total"),
+            func.sum(func.if_(ShortLinkClick.is_bot == False, 1, 0)).label("detail_human"),  # noqa: E712
+            func.sum(func.if_(ShortLinkClick.is_bot == True, 1, 0)).label("detail_bot"),  # noqa: E712
+            func.max(
+                func.if_(ShortLinkClick.is_bot == False, ShortLinkClick.clicked_at, None)  # noqa: E712
+            ).label("last_human_at"),
+        )
+        .where(ShortLinkClick.token.in_(select(batch_token_subq.c.token)))
+        .group_by(ShortLinkClick.token)
+        .subquery()
+    )
+
+
+def _per_token_last_human_ua_subq(batch_id: int):
+    """每个 token 最近一次真人点击的 user_agent。
+
+    用 ROW_NUMBER() 窗口函数取 partition by token、order by clicked_at desc 的
+    第一行。MySQL 8 原生支持。仅用于"已点击号码"列表上直观展示设备/浏览器，
+    不影响 bot 判定。
+    """
+    from sqlalchemy import case
+    batch_token_subq = (
+        select(ShortLinkLog.token)
+        .join(SMSLog, SMSLog.id == ShortLinkLog.sms_log_id)
+        .where(SMSLog.batch_id == batch_id)
+        .subquery()
+    )
+    ranked = (
+        select(
+            ShortLinkClick.token.label("token"),
+            ShortLinkClick.user_agent.label("user_agent"),
+            func.row_number().over(
+                partition_by=ShortLinkClick.token,
+                order_by=ShortLinkClick.clicked_at.desc(),
+            ).label("rn"),
+        )
+        .where(
+            ShortLinkClick.is_bot == False,  # noqa: E712
+            ShortLinkClick.token.in_(select(batch_token_subq.c.token)),
+        )
+        .subquery()
+    )
+    return (
+        select(
+            ranked.c.token.label("token"),
+            ranked.c.user_agent.label("last_human_ua"),
+        )
+        .where(ranked.c.rn == 1)
+        .subquery()
+    )
+
+
+@stats_router.get("/{batch_id}/click-stats")
+async def batch_click_stats(
+    batch_id: int,
+    db: AsyncSession = Depends(get_db),
+    account: Account = Depends(get_current_account),
+):
+    """批次点击概览：默认**只统计真人点击**，机器扫描自动过滤。
+
+    legacy 数据（明细表上线前的旧 click_count）按"无法判定"处理，
+    保留为真人计数（避免一刀切删除旧批次）。前端会用 `legacy_clicks` 字段
+    告诉用户这部分是估算值。
+
+    返回字段：
+      - total_links     : 短链总数
+      - clicked_links   : 真人点击过的短链数（含 legacy）
+      - total_clicks    : 真人点击次数（含 legacy）
+      - bot_clicks      : 已自动过滤的机器扫描次数（仅展示用）
+      - legacy_clicks   : 没有明细行的旧点击数（计入真人）
+    """
+    pt = _per_token_clicks_subq(batch_id)
+
+    # detail_human + MAX(0, click_count - detail_total) = "真人等价计数"
+    eff_human_expr = (
+        func.coalesce(pt.c.detail_human, 0)
+        + func.greatest(ShortLinkLog.click_count - func.coalesce(pt.c.detail_total, 0), 0)
+    )
+    legacy_expr = func.greatest(
+        ShortLinkLog.click_count - func.coalesce(pt.c.detail_total, 0), 0
+    )
+
+    total_rows, clicked_rows, total_clicks, bot_clicks, legacy_clicks = (
+        await db.execute(
+            select(
+                func.count(ShortLinkLog.id),
+                func.coalesce(func.sum(func.if_(eff_human_expr > 0, 1, 0)), 0),
+                func.coalesce(func.sum(eff_human_expr), 0),
+                func.coalesce(func.sum(func.coalesce(pt.c.detail_bot, 0)), 0),
+                func.coalesce(func.sum(legacy_expr), 0),
+            )
+            .select_from(ShortLinkLog)
+            .join(SMSLog, SMSLog.id == ShortLinkLog.sms_log_id)
+            .outerjoin(pt, pt.c.token == ShortLinkLog.token)
+            .where(SMSLog.batch_id == batch_id, SMSLog.account_id == account.id)
+        )
+    ).one()
+
+    return {
+        "success": True,
+        "data": {
+            "batch_id": batch_id,
+            "total_links": int(total_rows or 0),
+            "clicked_links": int(clicked_rows or 0),
+            "total_clicks": int(total_clicks or 0),
+            "bot_clicks": int(bot_clicks or 0),
+            "legacy_clicks": int(legacy_clicks or 0),
+        },
+    }
+
+
+@stats_router.get("/{batch_id}/clicked-phones")
+async def list_clicked_phones(
+    batch_id: int,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    account: Account = Depends(get_current_account),
+):
+    """JSON 预览：分页返回**真人**点击过短链的号码（机器扫描自动过滤）。
+
+    legacy clicks（无明细行）按真人计入，避免旧批次空白。
+    """
+    pt = _per_token_clicks_subq(batch_id)
+    ua_sq = _per_token_last_human_ua_subq(batch_id)
+    eff_human_expr = (
+        func.coalesce(pt.c.detail_human, 0)
+        + func.greatest(ShortLinkLog.click_count - func.coalesce(pt.c.detail_total, 0), 0)
+    )
+    # 排序：优先 last_human_at，缺失时回退到 sll.last_click_at
+    last_at_expr = func.coalesce(pt.c.last_human_at, ShortLinkLog.last_click_at)
+
+    base = (
+        select(
+            SMSLog.phone_number.label("phone_number"),
+            eff_human_expr.label("human_clicks"),
+            last_at_expr.label("last_click_at"),
+            ShortLinkLog.original_url.label("original_url"),
+            ShortLinkLog.token.label("token"),
+            ua_sq.c.last_human_ua.label("last_user_agent"),
+        )
+        .select_from(ShortLinkLog)
+        .join(SMSLog, SMSLog.id == ShortLinkLog.sms_log_id)
+        .outerjoin(pt, pt.c.token == ShortLinkLog.token)
+        .outerjoin(ua_sq, ua_sq.c.token == ShortLinkLog.token)
+        .where(
+            SMSLog.batch_id == batch_id,
+            SMSLog.account_id == account.id,
+            eff_human_expr > 0,
+        )
+        .order_by(last_at_expr.desc())
+    )
+
+    total = (
+        await db.execute(
+            select(func.count())
+            .select_from(ShortLinkLog)
+            .join(SMSLog, SMSLog.id == ShortLinkLog.sms_log_id)
+            .outerjoin(pt, pt.c.token == ShortLinkLog.token)
+            .where(
+                SMSLog.batch_id == batch_id,
+                SMSLog.account_id == account.id,
+                eff_human_expr > 0,
+            )
+        )
+    ).scalar_one()
+
+    offset = (page - 1) * page_size
+    rows = (await db.execute(base.offset(offset).limit(page_size))).all()
+
+    return {
+        "success": True,
+        "data": {
+            "total": int(total or 0),
+            "page": page,
+            "page_size": page_size,
+            "items": [
+                {
+                    "phone_number": r.phone_number,
+                    "click_count": int(r.human_clicks or 0),  # 兼容旧字段（仅真人）
+                    "human_clicks": int(r.human_clicks or 0),
+                    "last_click_at": r.last_click_at.isoformat() if r.last_click_at else None,
+                    "original_url": r.original_url,
+                    "token": r.token,
+                    "last_user_agent": r.last_user_agent,
+                }
+                for r in rows
+            ],
+        },
+    }
+
+
+@stats_router.get("/{batch_id}/clicked-phones.csv")
+async def download_clicked_phones_csv(
+    batch_id: int,
+    db: AsyncSession = Depends(get_db),
+    account: Account = Depends(get_current_account),
+):
+    """CSV 下载（仅真人）：机器扫描自动过滤。
+
+    历史教训：曾用 db.stream + 跨 generator yield 实现"边查边吐"，但
+    Depends(get_db) 在 handler 返回后立即关闭 session，generator 真正被
+    消费时游标已失效 → 客户端拿到的是空 CSV（200 + 仅表头）。
+    现改为先在 handler 内 .execute().all() 把行装入内存，再让 generator
+    序列化（脱离 db session），点击号码量级（百~万）完全可承受。
+    """
+    pt = _per_token_clicks_subq(batch_id)
+    eff_human_expr = (
+        func.coalesce(pt.c.detail_human, 0)
+        + func.greatest(ShortLinkLog.click_count - func.coalesce(pt.c.detail_total, 0), 0)
+    )
+    last_at_expr = func.coalesce(pt.c.last_human_at, ShortLinkLog.last_click_at)
+
+    ua_sq = _per_token_last_human_ua_subq(batch_id)
+    rows = (
+        await db.execute(
+            select(
+                SMSLog.phone_number,
+                eff_human_expr.label("human_clicks"),
+                last_at_expr.label("last_click_at"),
+                ShortLinkLog.original_url,
+                ShortLinkLog.token,
+                ua_sq.c.last_human_ua,
+            )
+            .select_from(ShortLinkLog)
+            .join(SMSLog, SMSLog.id == ShortLinkLog.sms_log_id)
+            .outerjoin(pt, pt.c.token == ShortLinkLog.token)
+            .outerjoin(ua_sq, ua_sq.c.token == ShortLinkLog.token)
+            .where(
+                SMSLog.batch_id == batch_id,
+                SMSLog.account_id == account.id,
+                eff_human_expr > 0,
+            )
+            .order_by(last_at_expr.desc())
+        )
+    ).all()
+
+    from app.utils.ua_display import format_device_browser
+
+    def gen():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow([
+            "phone_number", "human_clicks", "last_click_at",
+            "device_browser", "user_agent", "token", "original_url",
+        ])
+        yield buf.getvalue()
+        buf.seek(0); buf.truncate(0)
+        for r in rows:
+            ts = r.last_click_at.isoformat() if r.last_click_at else ""
+            w.writerow([
+                r.phone_number,
+                int(r.human_clicks or 0),
+                ts,
+                format_device_browser(r.last_human_ua),
+                r.last_human_ua or "",
+                r.token or "",
+                r.original_url or "",
+            ])
+            data = buf.getvalue()
+            if data:
+                yield data
+                buf.seek(0); buf.truncate(0)
+
+    fname = f"clicked_phones_batch_{batch_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+    return StreamingResponse(
+        gen(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+click_detail_router = APIRouter(prefix="/short-links", tags=["短链点击明细"])
+
+
+@click_detail_router.get("/{token}/clicks")
+async def list_token_clicks(
+    token: str,
+    limit: int = Query(100, ge=1, le=500),
+    include_bots: bool = Query(False, description="是否同时返回被过滤的机器扫描行（默认仅真人）"),
+    db: AsyncSession = Depends(get_db),
+    account: Account = Depends(get_current_account),
+):
+    """单个短链的点击明细，**默认只返回真人点击**；机器扫描经默认过滤。
+
+    若需排查（"为什么这条被判成机器"），传 include_bots=true 返回全部行。
+    """
+    if not token or not token.isalnum() or len(token) > 16:
+        raise HTTPException(status_code=400, detail="invalid token")
+
+    # 归属校验：token → ShortLinkLog → SMSLog.account_id，必须等于当前账户
+    owner_account_id = (
+        await db.execute(
+            select(SMSLog.account_id)
+            .select_from(ShortLinkLog)
+            .join(SMSLog, SMSLog.id == ShortLinkLog.sms_log_id)
+            .where(ShortLinkLog.token == token)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if owner_account_id is None or int(owner_account_id) != int(account.id):
+        # 不区分 "不存在" 与 "无权访问"，避免暴露 token 是否真实存在
+        raise HTTPException(status_code=404, detail="not found")
+
+    stmt = (
+        select(
+            ShortLinkClick.clicked_at,
+            ShortLinkClick.client_ip,
+            ShortLinkClick.user_agent,
+            ShortLinkClick.is_bot,
+            ShortLinkClick.bot_reason,
+        )
+        .where(ShortLinkClick.token == token)
+    )
+    if not include_bots:
+        stmt = stmt.where(ShortLinkClick.is_bot == False)  # noqa: E712
+    rows = (
+        await db.execute(
+            stmt.order_by(ShortLinkClick.clicked_at.desc()).limit(limit)
+        )
+    ).all()
+
+    # 同时返回该 token 被过滤的机器次数，便于前端展示"已过滤 N 次"
+    bot_total = (
+        await db.execute(
+            select(func.count())
+            .where(ShortLinkClick.token == token, ShortLinkClick.is_bot == True)  # noqa: E712
+        )
+    ).scalar_one()
+
+    return {
+        "success": True,
+        "data": {
+            "token": token,
+            "filtered_bot_count": int(bot_total or 0),
+            "items": [
+                {
+                    "clicked_at": r.clicked_at.isoformat() if r.clicked_at else None,
+                    "client_ip": r.client_ip,
+                    "user_agent": r.user_agent,
+                    "is_bot": bool(r.is_bot),
+                    "bot_reason": r.bot_reason,
+                }
+                for r in rows
+            ],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# 短链点击 CSV 一次性下载授权码
+#
+# 用途：管理员代客户生成下载链接，发给非系统用户（线下客户 / 临时合作方）
+# 在不登录系统的前提下拉一次 CSV。
+# 策略：一次性 + 24h 过期（消费即失效；过期自动 Redis TTL 清理）。
+# 安全：code 用 secrets.token_urlsafe(24) 生成，约 192 bit 熵；用 GETDEL
+# 原子消费，避免并发同 code 两次下载。
+# ---------------------------------------------------------------------------
+
+from datetime import timedelta as _td_csv  # noqa: E402
+from secrets import token_urlsafe as _csv_token  # noqa: E402
+
+from app.modules.sms.sms_batch import SmsBatch  # noqa: E402
+from app.utils.cache import get_redis_client as _csv_redis  # noqa: E402
+
+
+csv_code_router = APIRouter(prefix="/admin/short-link-csv-codes", tags=["短链 CSV 下载码"])
+csv_download_router = APIRouter(prefix="/sms/csv-download", tags=["短链 CSV 下载（免登）"])
+
+
+_CSV_CODE_TTL = 24 * 3600   # 24h
+_CSV_CODE_KEY_PREFIX = "slc:csv_code:"
+
+
+class _CsvCodeCreateBody(BaseModel):
+    batch_id: int = Field(..., gt=0, description="要授权下载的批次 ID")
+
+
+@csv_code_router.post("")
+async def create_csv_code(
+    body: _CsvCodeCreateBody,
+    db: AsyncSession = Depends(get_db),
+    admin: AdminUser = Depends(get_current_admin),
+):
+    """管理员生成一次性 CSV 下载授权码（24h 过期）。"""
+    batch = (
+        await db.execute(select(SmsBatch).where(SmsBatch.id == body.batch_id))
+    ).scalar_one_or_none()
+    if not batch:
+        raise HTTPException(404, "batch not found")
+
+    # 顺带把客户名带出来，方便管理员核对
+    acc = (
+        await db.execute(
+            select(Account.account_name, Account.id).where(Account.id == batch.account_id)
+        )
+    ).first()
+
+    code = _csv_token(24)   # 32 字符 URL-safe
+    import json as _json
+    payload = {
+        "batch_id": int(batch.id),
+        "account_id": int(batch.account_id),
+        "admin_id": int(admin.id),
+        "admin_username": admin.username,
+        "created_at": datetime.now().isoformat(),
+    }
+    r = await _csv_redis()
+    await r.set(f"{_CSV_CODE_KEY_PREFIX}{code}", _json.dumps(payload), ex=_CSV_CODE_TTL)
+
+    expires_at = datetime.now() + _td_csv(seconds=_CSV_CODE_TTL)
+
+    try:
+        from app.services.operation_log import log_operation
+        await log_operation(
+            db, admin_id=admin.id, admin_name=admin.username,
+            module="sms", action="short_link_csv_code_create",
+            target_type="sms_batch", target_id=str(batch.id),
+            title=f"为批次 #{batch.id} 生成 CSV 下载码",
+            detail={
+                "batch_id": int(batch.id),
+                "batch_name": getattr(batch, "batch_name", None),
+                "account_id": int(batch.account_id),
+                "account_username": acc.account_name if acc else None,
+                "expires_at": expires_at.isoformat(),
+            },
+        )
+    except Exception as e:
+        logger.warning(f"生成 CSV 下载码审计日志写入失败 batch_id={batch.id}: {e}")
+
+    return {
+        "success": True,
+        "data": {
+            "code": code,
+            "batch_id": int(batch.id),
+            "batch_name": getattr(batch, "batch_name", None),
+            "account_id": int(batch.account_id),
+            "account_username": acc.account_name if acc else None,
+            "expires_at": expires_at.isoformat(),
+            # 前端可拼出"复制即用"的免登 URL
+            "download_path": f"/api/v1/sms/csv-download/by-code/{code}.csv",
+        },
+    }
+
+
+@csv_download_router.get("/by-code/{code}.csv")
+async def download_clicked_phones_csv_by_code(
+    code: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """免登 CSV 下载：用一次性授权码换取该批次的点击号码 CSV。
+
+    code 一旦消费（成功 GETDEL）立即失效，重复点击下载链接会拿到 404。
+    """
+    # 简单合法性：长度 + 字符集（urlsafe 包含 [A-Za-z0-9_-]）
+    if not code or len(code) > 64 or not all(c.isalnum() or c in "_-" for c in code):
+        raise HTTPException(400, "invalid code")
+
+    r = await _csv_redis()
+    key = f"{_CSV_CODE_KEY_PREFIX}{code}"
+    # GETDEL：原子取出并删除，防止并发同 code 两次成功
+    raw = await r.getdel(key)
+    if not raw:
+        raise HTTPException(404, "code invalid or already used")
+
+    import json as _json
+    try:
+        payload = _json.loads(raw)
+        batch_id = int(payload["batch_id"])
+    except Exception:
+        raise HTTPException(500, "corrupted code payload")
+
+    pt = _per_token_clicks_subq(batch_id)
+    eff_human_expr = (
+        func.coalesce(pt.c.detail_human, 0)
+        + func.greatest(ShortLinkLog.click_count - func.coalesce(pt.c.detail_total, 0), 0)
+    )
+    last_at_expr = func.coalesce(pt.c.last_human_at, ShortLinkLog.last_click_at)
+
+    # 同 download_clicked_phones_csv 历史教训：先全表 .all() 拿到内存再 yield
+    ua_sq = _per_token_last_human_ua_subq(batch_id)
+    rows = (
+        await db.execute(
+            select(
+                SMSLog.phone_number,
+                eff_human_expr.label("human_clicks"),
+                last_at_expr.label("last_click_at"),
+                ShortLinkLog.original_url,
+                ShortLinkLog.token,
+                ua_sq.c.last_human_ua,
+            )
+            .select_from(ShortLinkLog)
+            .join(SMSLog, SMSLog.id == ShortLinkLog.sms_log_id)
+            .outerjoin(pt, pt.c.token == ShortLinkLog.token)
+            .outerjoin(ua_sq, ua_sq.c.token == ShortLinkLog.token)
+            .where(
+                SMSLog.batch_id == batch_id,
+                eff_human_expr > 0,
+            )
+            .order_by(last_at_expr.desc())
+        )
+    ).all()
+
+    from app.utils.ua_display import format_device_browser
+
+    def gen():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow([
+            "phone_number", "human_clicks", "last_click_at",
+            "device_browser", "user_agent", "token", "original_url",
+        ])
+        yield buf.getvalue()
+        buf.seek(0); buf.truncate(0)
+        for r in rows:
+            ts = r.last_click_at.isoformat() if r.last_click_at else ""
+            w.writerow([
+                r.phone_number,
+                int(r.human_clicks or 0),
+                ts,
+                format_device_browser(r.last_human_ua),
+                r.last_human_ua or "",
+                r.token or "",
+                r.original_url or "",
+            ])
+            data = buf.getvalue()
+            if data:
+                yield data
+                buf.seek(0); buf.truncate(0)
+
+    fname = f"clicked_phones_batch_{batch_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"
+    return StreamingResponse(
+        gen(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
